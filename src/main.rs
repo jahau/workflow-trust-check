@@ -21,6 +21,15 @@ struct Args {
 
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
+
+    /// Exit with status 1 when a finding of at least this severity is reported.
+    #[arg(long, value_enum, value_name = "SEVERITY")]
+    fail_on: Option<Severity>,
+
+    /// Search directories recursively. By default only the files directly
+    /// inside a directory are scanned, matching how GitHub loads workflows.
+    #[arg(long)]
+    recursive: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
@@ -42,6 +51,7 @@ struct Workflow {
 #[derive(Debug, Deserialize)]
 struct Job {
     permissions: Option<Spanned<Value>>,
+    uses: Option<Spanned<String>>,
     #[serde(default)]
     steps: Vec<Step>,
 }
@@ -54,11 +64,20 @@ struct Step {
     with: BTreeMap<String, Spanned<String>>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 enum Severity {
     High,
     Medium,
+}
+
+impl Severity {
+    fn rank(self) -> u8 {
+        match self {
+            Severity::High => 2,
+            Severity::Medium => 1,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -73,37 +92,58 @@ struct Finding {
 }
 
 #[derive(Debug, Serialize)]
+struct FileError {
+    file: String,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
 struct Report {
     scanned_files: usize,
     findings: Vec<Finding>,
+    errors: Vec<FileError>,
     disclaimer: &'static str,
 }
 
 const DISCLAIMER: &str =
     "Findings are limited heuristics, not proof that a workflow is safe or unsafe.";
 
+const EXIT_FINDINGS: i32 = 1;
+const EXIT_ERROR: i32 = 2;
+
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("workflow-trust-check: {error}");
-        std::process::exit(2);
+    match run() {
+        Ok(code) => std::process::exit(code),
+        Err(error) => {
+            eprintln!("workflow-trust-check: {error}");
+            std::process::exit(EXIT_ERROR);
+        }
     }
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let files = collect_workflows(&args.paths)?;
+    let files = collect_workflows(&args.paths, args.recursive)?;
     let mut findings = Vec::new();
+    let mut errors = Vec::new();
 
     for path in &files {
-        findings.extend(analyze_file(path)?);
+        match analyze_file(path) {
+            Ok(file_findings) => findings.extend(file_findings),
+            Err(error) => errors.push(FileError {
+                file: path.display().to_string(),
+                message: error.to_string(),
+            }),
+        }
     }
     findings.sort_by(|left, right| {
         (&left.file, left.line, left.rule).cmp(&(&right.file, right.line, right.rule))
     });
 
     let report = Report {
-        scanned_files: files.len(),
+        scanned_files: files.len() - errors.len(),
         findings,
+        errors,
         disclaimer: DISCLAIMER,
     };
     let stdout = io::stdout();
@@ -114,10 +154,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             writeln!(output, "{}", serde_json::to_string_pretty(&report)?)?;
         }
     }
-    Ok(())
+    for error in &report.errors {
+        eprintln!("workflow-trust-check: {}: {}", error.file, error.message);
+    }
+    Ok(exit_code(&report, args.fail_on))
 }
 
-fn collect_workflows(paths: &[PathBuf]) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+fn exit_code(report: &Report, fail_on: Option<Severity>) -> i32 {
+    if !report.errors.is_empty() {
+        return EXIT_ERROR;
+    }
+    let threshold_reached = fail_on.is_some_and(|threshold| {
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.severity.rank() >= threshold.rank())
+    });
+    if threshold_reached { EXIT_FINDINGS } else { 0 }
+}
+
+fn collect_workflows(
+    paths: &[PathBuf],
+    recursive: bool,
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let mut files = Vec::new();
     for path in paths {
         if !path.exists() {
@@ -131,7 +190,13 @@ fn collect_workflows(paths: &[PathBuf]) -> Result<Vec<PathBuf>, Box<dyn std::err
             }
             continue;
         }
-        for entry in WalkDir::new(path).follow_links(false) {
+        let walker = WalkDir::new(path).follow_links(false);
+        let walker = if recursive {
+            walker
+        } else {
+            walker.max_depth(1)
+        };
+        for entry in walker {
             let entry = entry?;
             if entry.file_type().is_file() && is_yaml(entry.path()) {
                 files.push(entry.into_path());
@@ -152,19 +217,24 @@ fn is_yaml(path: &Path) -> bool {
 }
 
 fn analyze_file(path: &Path) -> Result<Vec<Finding>, Box<dyn std::error::Error>> {
-    let source = fs::read_to_string(path)?;
-    let workflow: Workflow = from_yaml(0, &source).map_err(|error| {
-        format!(
-            "{}: invalid or unsupported workflow YAML: {error}",
-            path.display()
-        )
-    })?;
+    let source = fs::read_to_string(path).map_err(|error| format!("cannot read file: {error}"))?;
+    let workflow: Workflow = from_yaml(0, &source)
+        .map_err(|error| format!("invalid or unsupported workflow YAML: {error}"))?;
     let file = path.display().to_string();
     let mut findings = Vec::new();
-    let pull_request_target = workflow
-        .on
-        .as_ref()
-        .is_some_and(|events| contains_key_or_scalar(events, "pull_request_target"));
+    let privileged_triggers: Vec<&str> = workflow.on.as_ref().map_or_else(Vec::new, |events| {
+        PRIVILEGED_TRIGGERS
+            .iter()
+            .copied()
+            .filter(|trigger| contains_key_or_scalar(events, trigger))
+            .collect()
+    });
+    let privileged = !privileged_triggers.is_empty();
+    let trigger_list = privileged_triggers
+        .iter()
+        .map(|trigger| format!("`{trigger}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
 
     if workflow.jobs.values().any(|job| job.permissions.is_none())
         && let Some(permissions) = &workflow.permissions
@@ -188,35 +258,25 @@ fn analyze_file(path: &Path) -> Result<Vec<Finding>, Box<dyn std::error::Error>>
                 &format!("job `{job_name}`"),
             );
         }
+        if let Some(uses) = &job.uses {
+            check_unpinned(&mut findings, &file, uses, "reusable workflow");
+        }
         for step in &job.steps {
             if let Some(uses) = &step.uses {
                 let reference = uses.as_str();
-                if is_unpinned_third_party_action(reference) {
-                    findings.push(Finding {
-                        rule: "unpinned-third-party-action",
-                        severity: Severity::Medium,
-                        file: file.clone(),
-                        line: line(uses),
-                        evidence: reference.to_owned(),
-                        rationale: "A tag or branch can move, so the action code used by a future run may change without a workflow edit.".to_owned(),
-                        remediation: "Pin the action to a reviewed, full 40-character commit SHA; keep a version comment and update it deliberately.".to_owned(),
-                    });
-                }
-                if pull_request_target
+                check_unpinned(&mut findings, &file, uses, "action");
+                if privileged
                     && reference.starts_with("actions/checkout@")
-                    && step.with.get("ref").is_some_and(|checkout_ref| {
-                        contains_pull_request_head(checkout_ref.as_str())
-                    })
+                    && let Some(untrusted) = untrusted_checkout_input(&step.with)
                 {
-                    let checkout_ref = &step.with["ref"];
                     findings.push(Finding {
-                        rule: "pull-request-target-checks-out-head",
+                        rule: "privileged-checkout-of-untrusted-code",
                         severity: Severity::High,
                         file: file.clone(),
-                        line: line(checkout_ref),
-                        evidence: checkout_ref.as_str().to_owned(),
-                        rationale: "This workflow is triggered by `pull_request_target` and checks out the contributor-controlled pull request head. Subsequent steps may execute that code with the target event's elevated token or secrets.".to_owned(),
-                        remediation: "Avoid checking out or executing the pull request head in a privileged `pull_request_target` run. If validation is needed, use an isolated `pull_request` workflow without secrets or write permissions.".to_owned(),
+                        line: line(untrusted),
+                        evidence: untrusted.as_str().to_owned(),
+                        rationale: format!("This workflow is triggered by {trigger_list}, which runs with the base repository's token and secrets, and it checks out contributor-controlled code. Subsequent steps may execute that code with those privileges."),
+                        remediation: "Avoid checking out or executing contributor-controlled code in a privileged run. If validation is needed, use an isolated `pull_request` workflow without secrets or write permissions, and pass results to privileged steps only as data.".to_owned(),
                     });
                 }
             }
@@ -228,7 +288,7 @@ fn analyze_file(path: &Path) -> Result<Vec<Finding>, Box<dyn std::error::Error>>
                         source_line_offset(&source, run, expression_index).unwrap_or(line_offset);
                     findings.push(Finding {
                         rule: "untrusted-expression-in-run",
-                        severity: if pull_request_target {
+                        severity: if privileged {
                             Severity::High
                         } else {
                             Severity::Medium
@@ -236,8 +296,8 @@ fn analyze_file(path: &Path) -> Result<Vec<Finding>, Box<dyn std::error::Error>>
                         file: file.clone(),
                         line: line(run) + line_offset,
                         evidence: expression,
-                        rationale: if pull_request_target {
-                            "An event-controlled value is interpolated directly into a shell script in a `pull_request_target` workflow. Shell metacharacters in attacker-controlled text can become shell syntax, and the event may have privileged access.".to_owned()
+                        rationale: if privileged {
+                            format!("An event-controlled value is interpolated directly into a shell script in a workflow triggered by {trigger_list}. Shell metacharacters in attacker-controlled text can become shell syntax, and these events run with the base repository's token and secrets.")
                         } else {
                             "An event-controlled value is inserted into a generated shell script before execution, which can turn attacker-controlled text into shell syntax.".to_owned()
                         },
@@ -290,6 +350,56 @@ fn check_permissions(
     }
 }
 
+fn check_unpinned(findings: &mut Vec<Finding>, file: &str, uses: &Spanned<String>, kind: &str) {
+    if !is_unpinned_third_party_action(uses.as_str()) {
+        return;
+    }
+    findings.push(Finding {
+        rule: "unpinned-third-party-action",
+        severity: Severity::Medium,
+        file: file.to_owned(),
+        line: line(uses),
+        evidence: uses.as_str().to_owned(),
+        rationale: format!("A tag or branch can move, so the {kind} code used by a future run may change without a workflow edit."),
+        remediation: format!("Pin the {kind} to a reviewed, full 40-character commit SHA; keep a version comment and update it deliberately."),
+    });
+}
+
+/// Triggers that run in the base repository's context with access to secrets
+/// and a potentially write-scoped token, while carrying attacker-influenced data.
+const PRIVILEGED_TRIGGERS: &[&str] = &[
+    "pull_request_target",
+    "workflow_run",
+    "issue_comment",
+    "issues",
+    "discussion",
+    "discussion_comment",
+];
+
+const UNTRUSTED_CHECKOUT_REFS: &[&str] = &[
+    "github.event.pull_request.head.sha",
+    "github.event.pull_request.head.ref",
+    "github.event.pull_request.merge_commit_sha",
+    "github.event.workflow_run.head_sha",
+    "github.event.workflow_run.head_branch",
+    "github.head_ref",
+    "refs/pull/",
+];
+
+const UNTRUSTED_CHECKOUT_REPOSITORIES: &[&str] = &[
+    "github.event.pull_request.head.repo",
+    "github.event.workflow_run.head_repository",
+];
+
+fn untrusted_checkout_input(with: &BTreeMap<String, Spanned<String>>) -> Option<&Spanned<String>> {
+    let matches = |key: &str, patterns: &[&str]| {
+        with.get(key)
+            .filter(|value| patterns.iter().any(|pattern| value.contains(pattern)))
+    };
+    matches("ref", UNTRUSTED_CHECKOUT_REFS)
+        .or_else(|| matches("repository", UNTRUSTED_CHECKOUT_REPOSITORIES))
+}
+
 fn is_unpinned_third_party_action(reference: &str) -> bool {
     if reference.starts_with("./") || reference.starts_with("docker://") {
         return false;
@@ -315,9 +425,62 @@ const UNTRUSTED_FIELDS: &[&str] = &[
     "github.event.issue.body",
     "github.event.comment.body",
     "github.event.review.body",
+    "github.event.pull_request.head.repo.default_branch",
+    "github.event.review_comment.body",
+    "github.event.discussion.title",
+    "github.event.discussion.body",
     "github.event.head_commit.message",
+    "github.event.head_commit.author.name",
+    "github.event.head_commit.author.email",
+    "github.event.commits.*.message",
+    "github.event.commits.*.author.name",
+    "github.event.commits.*.author.email",
+    "github.event.pages.*.page_name",
+    "github.event.workflow_run.head_branch",
+    "github.event.workflow_run.display_title",
+    "github.event.workflow_run.head_commit.message",
+    "github.event.workflow_run.head_commit.author.name",
+    "github.event.workflow_run.head_commit.author.email",
     "github.head_ref",
 ];
+
+/// Rewrites property access into the dotted form used by `UNTRUSTED_FIELDS`:
+/// `a['b']` becomes `a.b`, and `a[0]` / `a[*]` become `a.*`. Context names
+/// are case-insensitive in GitHub expressions, so the result is lowercased.
+/// String literals outside brackets are kept so they can still be ignored.
+fn normalize_expression(expression: &str) -> String {
+    let mut normalized = String::with_capacity(expression.len());
+    let mut in_string = false;
+    let mut rest = expression;
+    while let Some(character) = rest.chars().next() {
+        if character == '\'' {
+            in_string = !in_string;
+        } else if !in_string
+            && character == '['
+            && let Some(close) = rest.find(']')
+        {
+            let inner = rest[1..close].trim();
+            let property = inner
+                .strip_prefix('\'')
+                .and_then(|name| name.strip_suffix('\''))
+                .filter(|name| !name.contains('\''));
+            if let Some(name) = property {
+                normalized.push('.');
+                normalized.push_str(name);
+                rest = &rest[close + 1..];
+                continue;
+            }
+            if inner == "*" || (!inner.is_empty() && inner.bytes().all(|b| b.is_ascii_digit())) {
+                normalized.push_str(".*");
+                rest = &rest[close + 1..];
+                continue;
+            }
+        }
+        normalized.push(character);
+        rest = &rest[character.len_utf8()..];
+    }
+    normalized.to_ascii_lowercase()
+}
 
 fn untrusted_expressions(script: &str) -> Vec<(String, usize, usize)> {
     let mut found = Vec::new();
@@ -331,9 +494,10 @@ fn untrusted_expressions(script: &str) -> Vec<(String, usize, usize)> {
         };
         let expression_end = expression_start + relative_end;
         let expression = script[expression_start..expression_end].trim();
+        let normalized = normalize_expression(expression);
         if UNTRUSTED_FIELDS
             .iter()
-            .any(|field| contains_field_reference(expression, field))
+            .any(|field| contains_field_reference(&normalized, field))
         {
             let full = format!("${{{{ {} }}}}", expression);
             if !found.iter().any(|(existing, _, _)| existing == &full) {
@@ -382,7 +546,7 @@ fn contains_field_reference(expression: &str, field: &str) -> bool {
 }
 
 fn is_expression_path_character(character: char) -> bool {
-    character.is_ascii_alphanumeric() || character == '_' || character == '.'
+    character.is_ascii_alphanumeric() || matches!(character, '_' | '.' | '*' | '-')
 }
 
 fn source_line_offset(
@@ -425,11 +589,6 @@ fn source_line_offset(
     None
 }
 
-fn contains_pull_request_head(value: &str) -> bool {
-    value.contains("github.event.pull_request.head.sha")
-        || value.contains("github.event.pull_request.head.ref")
-}
-
 fn contains_key_or_scalar(value: &Value, expected: &str) -> bool {
     match value {
         Value::String(scalar) => scalar == expected,
@@ -456,6 +615,13 @@ fn write_text(output: &mut impl Write, report: &Report) -> io::Result<()> {
         report.scanned_files,
         report.findings.len()
     )?;
+    if !report.errors.is_empty() {
+        writeln!(
+            output,
+            "{} file(s) could not be analyzed; see errors on stderr.",
+            report.errors.len()
+        )?;
+    }
     for finding in &report.findings {
         writeln!(
             output,
@@ -486,7 +652,7 @@ mod tests {
         let findings = analyze_file(&fixture("risky.yml")).unwrap();
         let rules: Vec<_> = findings.iter().map(|finding| finding.rule).collect();
         assert!(rules.contains(&"broad-token-permissions"));
-        assert!(rules.contains(&"pull-request-target-checks-out-head"));
+        assert!(rules.contains(&"privileged-checkout-of-untrusted-code"));
         assert!(rules.contains(&"untrusted-expression-in-run"));
         assert!(rules.contains(&"unpinned-third-party-action"));
         assert!(findings.iter().all(|finding| finding.line > 0));
@@ -574,14 +740,105 @@ mod tests {
     }
 
     #[test]
+    fn flags_unpinned_remote_reusable_workflows_only() {
+        let findings = analyze_file(&fixture("reusable-workflow.yml")).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, "unpinned-third-party-action");
+        assert_eq!(findings[0].line, 7);
+        assert!(findings[0].rationale.contains("reusable workflow"));
+    }
+
+    #[test]
+    fn flags_privileged_checkout_variants() {
+        let findings = analyze_file(&fixture("privileged-checkout-variants.yml")).unwrap();
+        let mut lines: Vec<_> = findings
+            .iter()
+            .filter(|finding| finding.rule == "privileged-checkout-of-untrusted-code")
+            .map(|finding| finding.line)
+            .collect();
+        lines.sort_unstable();
+        assert_eq!(lines, vec![11, 17, 23]);
+
+        let findings = analyze_file(&fixture("workflow-run-checkout.yml")).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, "privileged-checkout-of-untrusted-code");
+        assert!(findings[0].rationale.contains("`workflow_run`"));
+    }
+
+    #[test]
+    fn injection_in_other_privileged_triggers_is_high() {
+        let findings = analyze_file(&fixture("issue-comment-injection.yml")).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert!(matches!(findings[0].severity, Severity::High));
+        assert!(findings[0].rationale.contains("`issue_comment`"));
+    }
+
+    #[test]
+    fn matches_bracket_index_and_case_variants_of_untrusted_fields() {
+        for expression in [
+            "echo ${{ github.event['pull_request']['title'] }}",
+            "echo ${{ github.event.commits[0].message }}",
+            "echo ${{ github.event.commits.*.author.email }}",
+            "echo ${{ GitHub.Event.Issue.Title }}",
+            "echo ${{ github.event.workflow_run.head_branch }}",
+            "echo ${{ github.event.review_comment.body }}",
+        ] {
+            assert_eq!(untrusted_expressions(expression).len(), 1, "{expression}");
+        }
+        assert!(
+            untrusted_expressions("echo ${{ github.event['pull_request']['number'] }}").is_empty()
+        );
+        assert!(untrusted_expressions("echo ${{ 'github.event[0].commits' }}").is_empty());
+        assert_eq!(
+            normalize_expression("github.event['pull_request'].commits[12]"),
+            "github.event.pull_request.commits.*"
+        );
+    }
+
+    #[test]
+    fn exit_code_reflects_errors_and_fail_on_threshold() {
+        let finding = |severity| Finding {
+            rule: "test",
+            severity,
+            file: String::new(),
+            line: 1,
+            evidence: String::new(),
+            rationale: String::new(),
+            remediation: String::new(),
+        };
+        let report = |findings, errors| Report {
+            scanned_files: 1,
+            findings,
+            errors,
+            disclaimer: DISCLAIMER,
+        };
+        let medium = report(vec![finding(Severity::Medium)], Vec::new());
+        assert_eq!(exit_code(&medium, None), 0);
+        assert_eq!(exit_code(&medium, Some(Severity::High)), 0);
+        assert_eq!(exit_code(&medium, Some(Severity::Medium)), EXIT_FINDINGS);
+        let high = report(vec![finding(Severity::High)], Vec::new());
+        assert_eq!(exit_code(&high, Some(Severity::Medium)), EXIT_FINDINGS);
+        let failed = report(
+            Vec::new(),
+            vec![FileError {
+                file: "x.yml".to_owned(),
+                message: "bad".to_owned(),
+            }],
+        );
+        assert_eq!(exit_code(&failed, Some(Severity::High)), EXIT_ERROR);
+    }
+
+    #[test]
     fn json_report_keeps_evidence_and_disclaimer_fields() {
         let report = Report {
             scanned_files: 0,
             findings: Vec::new(),
+            errors: Vec::new(),
             disclaimer: DISCLAIMER,
         };
         let json = serde_json::to_value(report).unwrap();
         assert_eq!(json["scanned_files"], 0);
+        assert!(json["errors"].as_array().unwrap().is_empty());
         assert!(json["findings"].as_array().unwrap().is_empty());
         assert!(json["disclaimer"].as_str().unwrap().contains("not proof"));
     }

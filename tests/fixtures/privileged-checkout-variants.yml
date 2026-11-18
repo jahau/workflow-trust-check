@@ -1,0 +1,27 @@
+name: Checkout variants
+on: pull_request_target
+permissions:
+  contents: read
+jobs:
+  head-ref:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+  merge-ref:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.number }}/merge
+  fork-repository:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+  base:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
