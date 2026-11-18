@@ -1,0 +1,10 @@
+name: Multiple expression lines
+on:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "${{ github.event.pull_request.title }}"
+          echo "${{ github.event.pull_request.title || 'fallback' }}"

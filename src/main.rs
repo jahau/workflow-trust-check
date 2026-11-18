@@ -221,7 +221,11 @@ fn analyze_file(path: &Path) -> Result<Vec<Finding>, Box<dyn std::error::Error>>
                 }
             }
             if let Some(run) = &step.run {
-                for (expression, line_offset) in untrusted_expressions(run.as_str()) {
+                for (expression, line_offset, expression_index) in
+                    untrusted_expressions(run.as_str())
+                {
+                    let line_offset =
+                        source_line_offset(&source, run, expression_index).unwrap_or(line_offset);
                     findings.push(Finding {
                         rule: "untrusted-expression-in-run",
                         severity: if pull_request_target {
@@ -315,9 +319,10 @@ const UNTRUSTED_FIELDS: &[&str] = &[
     "github.head_ref",
 ];
 
-fn untrusted_expressions(script: &str) -> Vec<(String, usize)> {
+fn untrusted_expressions(script: &str) -> Vec<(String, usize, usize)> {
     let mut found = Vec::new();
     let mut search_from = 0;
+    let mut expression_index = 0;
     while let Some(relative_start) = script[search_from..].find("${{") {
         let start = search_from + relative_start;
         let expression_start = start + 3;
@@ -331,15 +336,16 @@ fn untrusted_expressions(script: &str) -> Vec<(String, usize)> {
             .any(|field| contains_field_reference(expression, field))
         {
             let full = format!("${{{{ {} }}}}", expression);
-            if !found.iter().any(|(existing, _)| existing == &full) {
+            if !found.iter().any(|(existing, _, _)| existing == &full) {
                 let line_offset = script[..start]
                     .bytes()
                     .filter(|byte| *byte == b'\n')
                     .count();
-                found.push((full, line_offset));
+                found.push((full, line_offset, expression_index));
             }
         }
         search_from = expression_end + 2;
+        expression_index += 1;
     }
     found
 }
@@ -377,6 +383,46 @@ fn contains_field_reference(expression: &str, field: &str) -> bool {
 
 fn is_expression_path_character(character: char) -> bool {
     character.is_ascii_alphanumeric() || character == '_' || character == '.'
+}
+
+fn source_line_offset(
+    source: &str,
+    run: &Spanned<String>,
+    expression_index: usize,
+) -> Option<usize> {
+    let span = run.span();
+    let start = span.start()?.character();
+    let end = span
+        .end()
+        .map(|marker| marker.character())
+        .unwrap_or_else(|| source.chars().count());
+    let byte_offset = |character_offset| {
+        source
+            .char_indices()
+            .nth(character_offset)
+            .map_or(source.len(), |(offset, _)| offset)
+    };
+    let start = byte_offset(start);
+    let end = byte_offset(end);
+    let scalar_source = source.get(start..end)?;
+    let mut search_from = 0;
+    let mut current_index = 0;
+    while let Some(relative_start) = scalar_source[search_from..].find("${{") {
+        let start = search_from + relative_start;
+        if current_index == expression_index {
+            return Some(
+                scalar_source[..start]
+                    .bytes()
+                    .filter(|byte| *byte == b'\n')
+                    .count(),
+            );
+        }
+        let expression_start = start + 3;
+        let expression_end = expression_start + scalar_source[expression_start..].find("}}")?;
+        search_from = expression_end + 2;
+        current_index += 1;
+    }
+    None
 }
 
 fn contains_pull_request_head(value: &str) -> bool {
@@ -475,7 +521,7 @@ mod tests {
     fn only_flags_known_untrusted_fields_inside_expressions() {
         assert_eq!(
             untrusted_expressions("echo '${{ github.event.pull_request.title }}'"),
-            vec![("${{ github.event.pull_request.title }}".to_owned(), 0)]
+            vec![("${{ github.event.pull_request.title }}".to_owned(), 0, 0)]
         );
         assert!(untrusted_expressions("echo '${{ github.sha }}'").is_empty());
         assert!(
@@ -497,6 +543,18 @@ mod tests {
         let findings = analyze_file(&fixture("multiline-expression.yml")).unwrap();
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].line, 10);
+        let folded_findings = analyze_file(&fixture("folded-expression.yml")).unwrap();
+        assert_eq!(folded_findings.len(), 1);
+        assert_eq!(folded_findings[0].line, 10);
+        let multiple_findings = analyze_file(&fixture("multiple-expression-lines.yml")).unwrap();
+        assert_eq!(multiple_findings.len(), 2);
+        assert_eq!(
+            multiple_findings
+                .iter()
+                .map(|finding| finding.line)
+                .collect::<Vec<_>>(),
+            vec![9, 10]
+        );
     }
 
     #[test]

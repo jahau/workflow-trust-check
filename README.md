@@ -52,7 +52,7 @@ cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-The integration fixtures cover positive detections and negative cases such as local actions, first-party actions, SHA pins, and trusted metadata. The CLI itself has no runtime network requirement.
+Fixture-based tests cover positive detections and negative cases such as local actions, first-party actions, SHA pins, trusted metadata, permission overrides, and multiline source locations. The CLI itself has no runtime network requirement.
 
 ## License review
 
