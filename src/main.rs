@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, ValueEnum};
-use marked_yaml::{Spanned, from_yaml};
+use marked_yaml::{LoaderOptions, Spanned, from_yaml_with_options};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use walkdir::WalkDir;
@@ -44,8 +44,7 @@ struct Workflow {
     #[serde(rename = "on")]
     on: Option<Spanned<Value>>,
     permissions: Option<Spanned<Value>>,
-    #[serde(default)]
-    jobs: BTreeMap<String, Job>,
+    jobs: Option<BTreeMap<String, Job>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -216,10 +215,48 @@ fn is_yaml(path: &Path) -> bool {
         })
 }
 
-fn analyze_file(path: &Path) -> Result<Vec<Finding>, Box<dyn std::error::Error>> {
-    let source = fs::read_to_string(path).map_err(|error| format!("cannot read file: {error}"))?;
-    let workflow: Workflow = from_yaml(0, &source)
+type Jobs = BTreeMap<String, Job>;
+
+/// Parses a workflow strictly enough that unsupported input is reported
+/// instead of being analyzed partially and looking clean.
+fn parse_workflow(raw: &str) -> Result<(Workflow, Jobs, &str), String> {
+    // Spans are relative to the text after the BOM; GitHub ignores the BOM too.
+    let source = raw.strip_prefix('\u{feff}').unwrap_or(raw);
+    let options = LoaderOptions::default().error_on_duplicate_keys(true);
+    let mut workflow: Workflow = from_yaml_with_options(0, source, options)
         .map_err(|error| format!("invalid or unsupported workflow YAML: {error}"))?;
+    let documents = count_yaml_documents(source)
+        .map_err(|error| format!("invalid or unsupported workflow YAML: {error}"))?;
+    if documents > 1 {
+        return Err(format!(
+            "unsupported workflow YAML: found {documents} YAML documents; a workflow file must contain exactly one"
+        ));
+    }
+    if workflow.on.is_none() {
+        return Err("not a GitHub Actions workflow: missing top-level `on` key".to_owned());
+    }
+    let jobs = workflow
+        .jobs
+        .take()
+        .ok_or("not a GitHub Actions workflow: missing top-level `jobs` key")?;
+    Ok((workflow, jobs, source))
+}
+
+fn count_yaml_documents(source: &str) -> Result<usize, yaml_rust2::ScanError> {
+    let mut parser = yaml_rust2::parser::Parser::new_from_str(source);
+    let mut documents = 0;
+    loop {
+        match parser.next_token()?.0 {
+            yaml_rust2::Event::DocumentStart => documents += 1,
+            yaml_rust2::Event::StreamEnd => return Ok(documents),
+            _ => {}
+        }
+    }
+}
+
+fn analyze_file(path: &Path) -> Result<Vec<Finding>, Box<dyn std::error::Error>> {
+    let raw = fs::read_to_string(path).map_err(|error| format!("cannot read file: {error}"))?;
+    let (workflow, jobs, source) = parse_workflow(&raw)?;
     let file = path.display().to_string();
     let mut findings = Vec::new();
     let privileged_triggers: Vec<&str> = workflow.on.as_ref().map_or_else(Vec::new, |events| {
@@ -236,7 +273,7 @@ fn analyze_file(path: &Path) -> Result<Vec<Finding>, Box<dyn std::error::Error>>
         .collect::<Vec<_>>()
         .join(", ");
 
-    if workflow.jobs.values().any(|job| job.permissions.is_none())
+    if jobs.values().any(|job| job.permissions.is_none())
         && let Some(permissions) = &workflow.permissions
     {
         check_permissions(
@@ -248,7 +285,7 @@ fn analyze_file(path: &Path) -> Result<Vec<Finding>, Box<dyn std::error::Error>>
         );
     }
 
-    for (job_name, job) in &workflow.jobs {
+    for (job_name, job) in &jobs {
         if let Some(permissions) = &job.permissions {
             check_permissions(
                 &mut findings,
@@ -285,7 +322,7 @@ fn analyze_file(path: &Path) -> Result<Vec<Finding>, Box<dyn std::error::Error>>
                     untrusted_expressions(run.as_str())
                 {
                     let line_offset =
-                        source_line_offset(&source, run, expression_index).unwrap_or(line_offset);
+                        source_line_offset(source, run, expression_index).unwrap_or(line_offset);
                     findings.push(Finding {
                         rule: "untrusted-expression-in-run",
                         severity: if privileged {
@@ -826,6 +863,35 @@ mod tests {
             }],
         );
         assert_eq!(exit_code(&failed, Some(Severity::High)), EXIT_ERROR);
+    }
+
+    #[test]
+    fn unsupported_or_non_workflow_yaml_is_an_error_not_a_clean_result() {
+        let error = |source: &str| parse_workflow(source).err().unwrap_or_default();
+        assert!(error("").contains("missing top-level `on`"));
+        assert!(error("version: 2\nupdates: []\n").contains("missing top-level `on`"));
+        assert!(error("on: push\n").contains("missing top-level `jobs`"));
+        assert!(
+            error("on: push\njobs: {}\n---\non: pull_request_target\njobs: {}\n")
+                .contains("2 YAML documents")
+        );
+        assert!(
+            error("on: push\njobs:\n  a: {}\n  a: {}\n").contains("Duplicate key"),
+            "duplicate keys hide earlier definitions"
+        );
+        assert!(error("a: &x 1\nb: *x\n").contains("anchor"));
+        assert!(parse_workflow("---\non: push\njobs: {}\n...\n").is_ok());
+    }
+
+    #[test]
+    fn byte_order_mark_does_not_hide_the_trigger() {
+        let source = "\u{feff}on: pull_request_target\njobs:\n  b:\n    steps:\n      - run: echo ${{ github.event.pull_request.title }}\n";
+        let (workflow, _, stripped) = parse_workflow(source).unwrap();
+        assert!(!stripped.starts_with('\u{feff}'));
+        assert!(contains_key_or_scalar(
+            workflow.on.as_ref().unwrap(),
+            "pull_request_target"
+        ));
     }
 
     #[test]
