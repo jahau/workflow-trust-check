@@ -166,7 +166,9 @@ fn analyze_file(path: &Path) -> Result<Vec<Finding>, Box<dyn std::error::Error>>
         .as_ref()
         .is_some_and(|events| contains_key_or_scalar(events, "pull_request_target"));
 
-    if let Some(permissions) = &workflow.permissions {
+    if workflow.jobs.values().any(|job| job.permissions.is_none())
+        && let Some(permissions) = &workflow.permissions
+    {
         check_permissions(
             &mut findings,
             &file,
@@ -219,7 +221,7 @@ fn analyze_file(path: &Path) -> Result<Vec<Finding>, Box<dyn std::error::Error>>
                 }
             }
             if let Some(run) = &step.run {
-                for expression in untrusted_expressions(run.as_str()) {
+                for (expression, line_offset) in untrusted_expressions(run.as_str()) {
                     findings.push(Finding {
                         rule: "untrusted-expression-in-run",
                         severity: if pull_request_target {
@@ -228,7 +230,7 @@ fn analyze_file(path: &Path) -> Result<Vec<Finding>, Box<dyn std::error::Error>>
                             Severity::Medium
                         },
                         file: file.clone(),
-                        line: line(run),
+                        line: line(run) + line_offset,
                         evidence: expression,
                         rationale: if pull_request_target {
                             "An event-controlled value is interpolated directly into a shell script in a `pull_request_target` workflow. Shell metacharacters in attacker-controlled text can become shell syntax, and the event may have privileged access.".to_owned()
@@ -313,25 +315,31 @@ const UNTRUSTED_FIELDS: &[&str] = &[
     "github.head_ref",
 ];
 
-fn untrusted_expressions(script: &str) -> Vec<String> {
+fn untrusted_expressions(script: &str) -> Vec<(String, usize)> {
     let mut found = Vec::new();
-    let mut remaining = script;
-    while let Some(start) = remaining.find("${{") {
+    let mut search_from = 0;
+    while let Some(relative_start) = script[search_from..].find("${{") {
+        let start = search_from + relative_start;
         let expression_start = start + 3;
-        let Some(end) = remaining[expression_start..].find("}}") else {
+        let Some(relative_end) = script[expression_start..].find("}}") else {
             break;
         };
-        let expression = remaining[expression_start..expression_start + end].trim();
+        let expression_end = expression_start + relative_end;
+        let expression = script[expression_start..expression_end].trim();
         if UNTRUSTED_FIELDS
             .iter()
             .any(|field| contains_field_reference(expression, field))
         {
             let full = format!("${{{{ {} }}}}", expression);
-            if !found.contains(&full) {
-                found.push(full);
+            if !found.iter().any(|(existing, _)| existing == &full) {
+                let line_offset = script[..start]
+                    .bytes()
+                    .filter(|byte| *byte == b'\n')
+                    .count();
+                found.push((full, line_offset));
             }
         }
-        remaining = &remaining[expression_start + end + 2..];
+        search_from = expression_end + 2;
     }
     found
 }
@@ -467,7 +475,7 @@ mod tests {
     fn only_flags_known_untrusted_fields_inside_expressions() {
         assert_eq!(
             untrusted_expressions("echo '${{ github.event.pull_request.title }}'"),
-            vec!["${{ github.event.pull_request.title }}"]
+            vec![("${{ github.event.pull_request.title }}".to_owned(), 0)]
         );
         assert!(untrusted_expressions("echo '${{ github.sha }}'").is_empty());
         assert!(
@@ -482,6 +490,29 @@ mod tests {
         )
         .len()
             == 1);
+    }
+
+    #[test]
+    fn multiline_expression_reports_its_own_yaml_line() {
+        let findings = analyze_file(&fixture("multiline-expression.yml")).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].line, 10);
+    }
+
+    #[test]
+    fn workflow_write_is_not_reported_when_every_job_overrides_it() {
+        assert!(
+            analyze_file(&fixture("permissions-overridden.yml"))
+                .unwrap()
+                .iter()
+                .all(|finding| finding.rule != "workflow-wide-write-permission")
+        );
+        assert!(
+            analyze_file(&fixture("permissions-inherited.yml"))
+                .unwrap()
+                .iter()
+                .any(|finding| finding.rule == "workflow-wide-write-permission")
+        );
     }
 
     #[test]
