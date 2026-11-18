@@ -324,7 +324,7 @@ fn untrusted_expressions(script: &str) -> Vec<String> {
         let expression = remaining[expression_start..expression_start + end].trim();
         if UNTRUSTED_FIELDS
             .iter()
-            .any(|field| expression.contains(field))
+            .any(|field| contains_field_reference(expression, field))
         {
             let full = format!("${{{{ {} }}}}", expression);
             if !found.contains(&full) {
@@ -334,6 +334,41 @@ fn untrusted_expressions(script: &str) -> Vec<String> {
         remaining = &remaining[expression_start + end + 2..];
     }
     found
+}
+
+fn contains_field_reference(expression: &str, field: &str) -> bool {
+    let mut in_string = false;
+    let mut chars = expression.char_indices().peekable();
+    while let Some((index, character)) = chars.next() {
+        if character == '\'' {
+            if in_string && chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                chars.next();
+                continue;
+            }
+            in_string = !in_string;
+            continue;
+        }
+        if in_string || !expression[index..].starts_with(field) {
+            continue;
+        }
+        let previous_is_identifier = expression[..index]
+            .chars()
+            .next_back()
+            .is_some_and(is_expression_path_character);
+        let end = index + field.len();
+        let next_is_identifier = expression[end..]
+            .chars()
+            .next()
+            .is_some_and(is_expression_path_character);
+        if !previous_is_identifier && !next_is_identifier {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_expression_path_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '_' || character == '.'
 }
 
 fn contains_pull_request_head(value: &str) -> bool {
@@ -435,6 +470,13 @@ mod tests {
             vec!["${{ github.event.pull_request.title }}"]
         );
         assert!(untrusted_expressions("echo '${{ github.sha }}'").is_empty());
+        assert!(
+            untrusted_expressions("echo \"${{ 'github.event.pull_request.title' }}\"").is_empty()
+        );
+        assert!(
+            untrusted_expressions("echo '${{ github.event.pull_request.title_suffix }}'")
+                .is_empty()
+        );
         assert!(untrusted_expressions(
             "echo '${{ github.event.pull_request.title }}' '${{ github.event.pull_request.title }}'"
         )
