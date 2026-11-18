@@ -1,0 +1,19 @@
+Scanned 1 workflow file(s); 4 finding(s).
+examples/risky.yml:5: High [broad-token-permissions]
+  Evidence: workflow: permissions: write-all
+  Why: The workflow token is granted write access across all permission scopes, increasing the impact of a compromised step.
+  Guidance: Replace `write-all` with only the required permission scopes and grant write access at the narrowest job level.
+examples/risky.yml:12: High [privileged-checkout-of-untrusted-code]
+  Evidence: ${{ github.event.pull_request.head.sha }}
+  Why: This workflow is triggered by `pull_request_target`, which runs with the base repository's token and secrets, and it checks out contributor-controlled code. Subsequent steps may execute that code with those privileges.
+  Guidance: Avoid checking out or executing contributor-controlled code in a privileged run. If validation is needed, use an isolated `pull_request` workflow without secrets or write permissions, and pass results to privileged steps only as data.
+examples/risky.yml:13: Medium [unpinned-third-party-action]
+  Evidence: acme/labeler@v2
+  Why: A tag or branch can move, so the action code used by a future run may change without a workflow edit.
+  Guidance: Pin the action to a reviewed, full 40-character commit SHA; keep a version comment and update it deliberately.
+examples/risky.yml:15: High [untrusted-expression-in-run]
+  Evidence: ${{ github.event.pull_request.title }}
+  Why: An event-controlled value is interpolated directly into a shell script in a workflow triggered by `pull_request_target`. Shell metacharacters in attacker-controlled text can become shell syntax, and these events run with the base repository's token and secrets.
+  Guidance: Pass the value through an `env:` entry and quote/validate the environment variable in the script, or handle it in an action rather than interpolating it into `run:`.
+
+Findings are limited heuristics, not proof that a workflow is safe or unsafe.
