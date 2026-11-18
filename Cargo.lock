@@ -368,6 +368,7 @@ dependencies = [
  "serde",
  "serde_json",
  "walkdir",
+ "yaml-rust2",
 ]
 
 [[package]]

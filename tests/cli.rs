@@ -44,6 +44,40 @@ fn json(output: &Output) -> serde_json::Value {
 }
 
 #[test]
+fn documented_examples_produce_the_documented_output() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for (input, expected) in [
+        ("examples/risky.yml", "examples/risky.txt"),
+        ("examples/basic.yml", ""),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_workflow-trust-check"))
+            .arg(input)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{input}");
+        let stdout = String::from_utf8(output.stdout)
+            .unwrap()
+            .replace("\r\n", "\n");
+        if expected.is_empty() {
+            assert!(stdout.starts_with("Scanned 1 workflow file(s); 0 finding(s)."));
+        } else {
+            let expected = fs::read_to_string(root.join(expected))
+                .unwrap()
+                .replace("\r\n", "\n");
+            assert_eq!(stdout, expected, "{input}");
+            let readme = fs::read_to_string(root.join("README.md"))
+                .unwrap()
+                .replace("\r\n", "\n");
+            assert!(
+                readme.contains(&format!("$ workflow-trust-check {input}\n{expected}```")),
+                "README example for {input} is out of date"
+            );
+        }
+    }
+}
+
+#[test]
 fn findings_exit_zero_unless_fail_on_threshold_is_reached() {
     let dir = TempDir::new("fail-on");
     dir.write("medium.yml", MEDIUM);
