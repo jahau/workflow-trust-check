@@ -1,0 +1,9 @@
+name: Comment command
+on: issue_comment
+permissions:
+  contents: read
+jobs:
+  respond:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ github.event.comment.body }}"

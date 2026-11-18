@@ -1,0 +1,12 @@
+name: Reusable and local actions
+on:
+  workflow_call:
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/lint
+      - uses: docker://alpine:3.20
+      - uses: acme/action@0123456789abcdef0123456789abcdef01234567
+        with:
+          title: ${{ github.event.pull_request.title }}

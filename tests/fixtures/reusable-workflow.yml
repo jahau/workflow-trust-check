@@ -1,0 +1,11 @@
+name: Reusable callers
+on: push
+permissions:
+  contents: read
+jobs:
+  remote:
+    uses: acme/shared/.github/workflows/build.yml@main
+  pinned:
+    uses: acme/shared/.github/workflows/build.yml@0123456789abcdef0123456789abcdef01234567
+  local:
+    uses: ./.github/workflows/local.yml

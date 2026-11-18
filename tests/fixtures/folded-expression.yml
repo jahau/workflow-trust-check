@@ -1,0 +1,10 @@
+name: Folded expression
+on:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: >
+          echo before
+          echo "${{ github.event.pull_request.title }}"
