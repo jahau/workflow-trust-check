@@ -1,0 +1,15 @@
+name: Review candidate
+on:
+  pull_request_target:
+    types: [opened]
+permissions: write-all
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: acme/commenter@v2
+      - name: Show title
+        run: echo "${{ github.event.pull_request.title }}"
